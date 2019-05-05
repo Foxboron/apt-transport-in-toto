@@ -30,6 +30,8 @@ import signal
 import intoto
 import logging
 
+from shutil import copyfile
+
 if sys.version_info[0] == 2:
   import subprocess32 as subprocess
 else:
@@ -58,16 +60,16 @@ os.environ['COVERAGE_PROCESS_START'] = os.path.join(TEST_PATH, "..",
     ".coveragerc")
 
 # Path to mock rebuilder server executable
-MOCK_REBUILDER_EXEC = os.path.join(TEST_PATH, "serve_metadata.py")
+#MOCK_REBUILDER_EXEC = os.path.join(TEST_PATH, "serve_metadata.py")
 
 
 # Default values for the `601 Configuration` and `600 URI Acquire` message
 # used in tests below. May be overridden in a test.
 _CONFIG_DEFAULTS = {
   "log_level": LOG_LEVEL,
-  "rebuilder1": "http://127.0.0.1:8081",
-  "rebuilder2": "http://127.0.0.1:8082",
-  "layout_path": os.path.join(TEST_DATA_PATH, "test.layout"),
+  "rebuilder1": "http://127.0.0.1:5000",
+  "layout_path": os.path.join(TEST_DATA_PATH, "test.layout.transparency-log"),
+  "tree_roots": os.path.join(TEST_DATA_PATH, "tree_roots"),
   "layout_keyid": "88876A89E3D4698F83D3DB0E72E33CA3E0E04E46",
   "gpg_home": os.path.join(TEST_DATA_PATH, "gpg_keyring"),
   "no_fail": "false"
@@ -86,9 +88,9 @@ _MSG_CAPABILITIES = \
 _MSG_CONFIG = \
 """601 Configuration
 Config-Item: APT::Intoto::Rebuilders::={rebuilder1}
-Config-Item: APT::Intoto::Rebuilders::={rebuilder2}
 Config-Item: APT::Intoto::LogLevel::={log_level}
 Config-Item: APT::Intoto::Layout::={layout_path}
+Config-Item: APT::Intoto::TreeRoots::={tree_roots}
 Config-Item: APT::Intoto::Keyids::={layout_keyid}
 Config-Item: APT::Intoto::GPGHomedir::={gpg_home}
 Config-Item: APT::Intoto::NoFail::={no_fail}
@@ -187,6 +189,10 @@ class InTotoTransportTestCase(unittest.TestCase):
 
   def setUp(self):
     """Start intoto transport anew for each test. """
+
+    # Copy tree roots so they are properly reset
+    copyfile(os.path.join(TEST_DATA_PATH, "tree_roots.start"), os.path.join(TEST_DATA_PATH, "tree_roots"))
+
     self.intoto_proc = subprocess.Popen(
         ["python", MEASURE_COVERAGE, INTOTO_EXEC],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,

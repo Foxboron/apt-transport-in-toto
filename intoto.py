@@ -110,6 +110,9 @@ import logging.handlers
 import requests
 import tempfile
 import shutil
+import json
+import hashlib
+
 
 if sys.version_info[0] == 2: # pragma: no cover
   import Queue # pylint: disable=import-error
@@ -122,6 +125,8 @@ import in_toto.util
 import in_toto.verifylib
 import in_toto.models.link
 import in_toto.models.metadata
+
+import securesystemslib.keys
 
 # Configure base logger with lowest log level (i.e. log all messages) and
 # finetune the actual log levels on handlers
@@ -463,6 +468,7 @@ global_info = {
     "Rebuilders": [],
     "GPGHomedir": "",
     "Layout": "",
+    "TreeRoots": "",
     "Keyids": [],
     "NoFail": False
   }
@@ -499,7 +505,7 @@ def _intoto_parse_config(message_data):
       if config_name in ["Rebuilders", "Keyids"]:
         global_info["config"][config_name].append(config_value)
 
-      elif config_name in ["GPGHomedir", "Layout"]:
+      elif config_name in ["GPGHomedir", "Layout", "TreeRoots"]:
         global_info["config"][config_name] = config_value
 
       elif config_name == "LogLevel":
@@ -518,6 +524,88 @@ def _intoto_parse_config(message_data):
 
   logger.debug("Configured intoto session: '{}'".format(global_info["config"]))
 
+
+def validate_signature(rebuilder, node):
+  r = requests.get("{}/api/crypto/key".format(rebuilder))
+  public_key = r.json()
+  signature = {'keyid': public_key["keyid"], 
+               'sig': node["signature"]}
+  return securesystemslib.keys.verify_signature(public_key, signature, node["hash"])
+
+
+def compare_hash(node):
+  h = hashlib.sha512()
+  h.update(node["type"].encode('utf-8'))
+  for k, v in sorted(node["data"].items()):
+    h.update((k+v).encode('utf-8'))
+  h.update(node["left"].encode('utf-8'))
+  h.update(node["right"].encode('utf-8'))
+  logger.info('Comparing hashes: {}'.format(h.hexdigest() == node["hash"]))
+  return h.hexdigest() == node["hash"]
+
+
+def validate_chain(root, chain):
+  if not compare_hash(root):
+    return False
+  if not chain:
+    return True
+  chain = chain[:]
+  s = chain.pop(0)[1]["hash"]
+  for node in chain:
+    if not compare_hash(node[1]):
+      return False
+    h = hashlib.sha512()
+    if node[0] == "LEFT":
+      h.update(("level"+node[1]["hash"]+s).encode('utf-8'))
+    if node[0] == "RIGHT":
+      h.update(("level"+s+node[1]["hash"]).encode('utf-8'))
+    s = h.hexdigest()
+  logger.info('Validating chain hash: {}'.format(root["hash"] == s))
+  return root["hash"] == s
+
+
+def verify_consistency(rebuilder):
+  with open(global_info["config"]["TreeRoots"], "r") as f:
+    roots = json.loads(f.read())
+    hash_digest = roots[rebuilder]["hash"]
+    count  = roots[rebuilder]["count"]
+    r = requests.get("{}/api/log/tree/consistency/{}/{}".format(rebuilder, hash_digest, count))
+    j = r.json()
+    if not validate_signature(rebuilder, j["root"]):
+      return False
+    if not validate_chain(j["root"], j["path"]):
+      return False
+    return r.json()
+
+def store_new_tree_root(rebuilder, proof):
+  with open(global_info["config"]["TreeRoots"], "r+") as f:
+    j = json.loads(f.read())
+    root = proof["root"]
+    j[rebuilder] = {
+            "hash": root["hash"],
+            "signature": root["signature"],
+            "count": proof["leaf nodes"]
+        }
+    f.seek(0)
+    f.write(json.dumps(j, indent=4))
+
+def fetch_rebuild(rebuilder, pkgname, version):
+  endpoint = "{}/api/rebuilder/fetch/{}/{}".format(rebuilder, pkgname, version)
+  logger.info("Request in-toto metadata from {}".format(endpoint))
+  r = requests.get(endpoint)
+  response = r.json()
+  revoked = []
+  for entry, audit in response:
+    if not compare_hash(entry):
+      continue
+    if not validate_chain(audit["root"], audit["path"]):
+      return False
+    if entry["hash"] in revoked:
+      continue
+    if entry["data"]["type"] == "revoke":
+      revoked.append(entry["data"]["hash"])
+      continue
+    return entry
 
 def _intoto_verify(message_data):
   """Upon http `201 URI Done` check if the downloaded package is in the global
@@ -573,21 +661,21 @@ def _intoto_verify(message_data):
       .format(len(global_info["config"]["Rebuilders"])))
   # Download link files to verification directory
   for rebuilder in global_info["config"]["Rebuilders"]:
-    # Accept rebuilders with and without trailing slash
-    endpoint = "{rebuilder}/sources/{name}/{version}/metadata".format(
-        rebuilder=rebuilder.rstrip("/"), name=pkg_name,
-        version=pkg_version_release)
-
-    logger.info("Request in-toto metadata from {}".format(endpoint))
 
     try:
-      # Fetch metadata
-      response = requests.get(endpoint)
-      if not response.status_code == 200:
-        raise Exception("server response: {}".format(response.status_code))
+      proof = verify_consistency(rebuilder)
+      if not proof:
+        raise Exception("Can't verify consistency on rebuilder {}".format(rebuilder))
 
-      # Decode json
-      link_json = response.json()
+      store_new_tree_root(rebuilder, proof)
+
+      rebuild = fetch_rebuild(rebuilder.rstrip("/"), pkg_name, pkg_version_release)
+      if not rebuild:
+        raise Exception("No available rebuild from {}".format(rebuilder))
+
+      link_json = json.loads(rebuild["data"]["linkmetadata"])
+
+      logger.info('{}'.format(link_json))
 
       # Load as in-toto metadata
       link_metablock = in_toto.models.metadata.Metablock(
@@ -606,7 +694,7 @@ def _intoto_verify(message_data):
       # We don't fail just yet if metadata cannot be downloaded or stored
       # successfully. Instead we let in-toto verification further below fail if
       # there is not enought metadata
-      logger.warning("Could not retrieve in-toto metadata from rebuilder '{}',"
+      logger.exception("Could not retrieve in-toto metadata from rebuilder '{}',"
           " reason was: {}".format(rebuilder, e))
       continue
 
