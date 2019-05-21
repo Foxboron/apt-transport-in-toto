@@ -567,7 +567,10 @@ def validate_chain(root, chain):
 def verify_consistency(rebuilder):
   with open(global_info["config"]["TreeRoots"], "r") as f:
     roots = json.loads(f.read())
-    hash_digest = roots[rebuilder]["hash"]
+    rebuilder_tree_roots = roots.get(rebuilder)
+    if not rebuilder_tree_roots:
+      raise Exception("No tree roots configured for {}".format(rebuilder))
+    hash_digest = rebuilder_tree_roots["hash"]
     count  = roots[rebuilder]["count"]
     r = requests.get("{}/api/log/tree/consistency/{}/{}".format(rebuilder, hash_digest, count))
     j = r.json()
